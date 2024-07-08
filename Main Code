@@ -1,0 +1,161 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# Initialize YOLOv8s model
+model = YOLO('yolov8s.pt')
+
+# Path to the input video file
+video_path = r'C:\Users\User\OneDrive\Desktop\Intel\Vehicle_Detection_Image_Dataset\sample_video.mp4'
+
+# Open the video capture
+cap = cv2.VideoCapture(video_path)
+
+# Get the frame dimensions for window resizing
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+# Define the desired output frame size
+output_width = 640
+output_height = 480
+
+# Create a resizable window
+cv2.namedWindow('Frame', cv2.WINDOW_NORMAL)
+cv2.resizeWindow('Frame', output_width, output_height)
+
+# Parameters for edge detection
+edge_threshold1 = 50  # Lower threshold
+edge_threshold2 = 150  # Upper threshold
+kernel = np.ones((3, 3), np.uint8)  # Kernel for morphological operations
+
+# Parameters for cut-in detection
+alert_threshold = 0.7  # Confidence threshold for detection
+fps = cap.get(cv2.CAP_PROP_FPS)
+alert_frame_threshold = int(alert_threshold * fps)
+
+# Initialize variables for cut-in detection
+cut_in_detected = False
+cut_in_start_frame = None
+
+# Define the codec and create VideoWriter object
+fourcc = cv2.VideoWriter_fourcc(*'XVID')
+out = cv2.VideoWriter('output_video.avi', fourcc, fps, (output_width, output_height))
+
+# Variables for TTC calculation
+prev_boxes = []
+prev_frame_time = None
+
+# TTC alert threshold
+ttc_alert_lower = 0.5
+ttc_alert_upper = 0.7
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # Resize the frame to the desired output size
+    frame = cv2.resize(frame, (output_width, output_height))
+
+    # Preprocessing: Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+
+    # Adaptive thresholding for better edge detection
+    mean_intensity = np.mean(gray)
+    edge_threshold1 = max(0, 0.66 * mean_intensity)
+    edge_threshold2 = min(255, 1.33 * mean_intensity)
+
+    # Perform edge detection using Canny edge detector
+    edges = cv2.Canny(gray, edge_threshold1, edge_threshold2)
+
+    # Morphological operations to enhance edges
+    edges = cv2.dilate(edges, kernel, iterations=1)
+    edges = cv2.erode(edges, kernel, iterations=1)
+
+    # Perform object detection using YOLOv8s
+    results = model(frame)[0]
+
+    car_detected = False
+    current_boxes = []
+
+    # Iterate over detected objects
+    for result in results.boxes:
+        box = result.xyxy[0]
+        cls = int(result.cls[0])
+        conf = result.conf[0]
+        label = model.names[cls]
+
+        # Check if the detected object is a car and meets the alert threshold
+        if label == 'car' and conf >= alert_threshold:
+            car_detected = True
+
+        # Draw the bounding box
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        current_boxes.append((x1, y1, x2, y2))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 155, 0), 2)  # Green bounding box
+
+    # Calculate TTC
+    if prev_boxes and prev_frame_time:
+        current_frame_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0  # Current time in seconds
+        time_diff = current_frame_time - prev_frame_time
+
+        for i, (x1, y1, x2, y2) in enumerate(current_boxes):
+            if i < len(prev_boxes):
+                prev_x1, prev_y1, prev_x2, prev_y2 = prev_boxes[i]
+
+                # Calculate distances
+                distance_current = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+                distance_prev = np.sqrt((prev_x2 - prev_x1) ** 2 + (prev_y2 - prev_y1) ** 2)
+
+                # Calculate relative speed (pixels per second)
+                speed = (distance_prev - distance_current) / time_diff if time_diff > 0 else 0
+
+                # Estimate TTC (assuming constant speed)
+                ttc = distance_current / speed if speed != 0 else float('inf')
+
+                # Display vehicle name in yellow and TTC in blue
+                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)  # Yellow vehicle name
+                cv2.putText(frame, f'TTC: {ttc:.2f}s', (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)  # Blue TTC
+
+                # Check if TTC is below the alert threshold
+                if ttc_alert_lower < ttc < ttc_alert_upper:
+                    cv2.putText(frame, 'ALERT: TTC below threshold!', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    print("ALERT: TTC below threshold!")
+
+    # Update previous frame data
+    prev_boxes = current_boxes
+    prev_frame_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+
+    # Check for cut-in detection based on object detection
+    if car_detected:
+        if not cut_in_detected:
+            cut_in_detected = True
+            cut_in_start_frame = cap.get(cv2.CAP_PROP_POS_FRAMES)
+    else:
+        cut_in_detected = False
+
+    # Check if the cut-in has persisted beyond the alert threshold
+    if cut_in_detected:
+        current_frame = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        if current_frame - cut_in_start_frame >= alert_frame_threshold:
+            print("ALERT: Vehicle cut-in detected for 0.7 seconds!")
+            cut_in_detected = False
+
+    # Write the frame to the output video file
+    out.write(frame)
+
+    # Display the frames
+    cv2.imshow('Frame', frame)
+    cv2.imshow('Edges', edges)  # Display edges for debugging purposes
+
+    # Check for user input to quit
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Release the video capture, video writer, and close all windows
+cap.release()
+out.release()
+cv2.destroyAllWindows()
